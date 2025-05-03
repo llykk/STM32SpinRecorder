@@ -73,8 +73,9 @@ extern void  LSM6DSO_Bus_Delay(uint32_t ms);
 extern int32_t LSM6DSO_Bus_WriteReg(uint16_t addrDev, uint16_t addrReg, uint8_t *data, uint16_t len);
 extern int32_t LSM6DSO_Bus_ReadReg(uint16_t addrDev, uint16_t addrReg, uint8_t *data, uint16_t len);
 
+uint32_t SendToUartQueue(uint8_t *buff, uint32_t size);
 uint32_t SendStrToUartQueue(char *str);
-uint32_t uart_print(char *str);
+uint32_t uart_send(uint8_t *buff, uint32_t size);
 
 /* USER CODE END PFP */
 
@@ -92,7 +93,8 @@ void pvReleaseBuffer(void *pv)
 
 void vTask1(void *param)
 {
-	/*LSM6DSO_IO_t bus;
+	char *str;
+	LSM6DSO_IO_t bus;
 	bus.BusType = 0;
 	bus.Address = 0xD6;
 	bus.Init = LSM6DSO_Bus_Init;
@@ -102,17 +104,77 @@ void vTask1(void *param)
 	
 	LSM6DSO_Object_t accGyro;
 	LSM6DSO_RegisterBusIO(&accGyro, &bus);
-	LSM6DSO_Init(&accGyro);*/
+	LSM6DSO_Init(&accGyro);
 	
-	char *str;
-	/*str = malloc_string("LSM6DSO init OK\r\n");
-	SendStrToUartQueue(str);*/
+	uint8_t id;
+	LSM6DSO_ReadID(&accGyro, &id);
+	if(id != LSM6DSO_ID)
+	{
+		str = malloc_string("LSM6DSO INVALID ID\r\n");
+	}
+	else
+	{
+		str = malloc_string("LSM6DSO init OK\r\n");
+	}
+	SendStrToUartQueue(str);
+	
+	LSM6DSO_ACC_Enable(&accGyro);
+	LSM6DSO_ACC_SetOutputDataRate(&accGyro, 104.0f);
+	LSM6DSO_GYRO_Enable(&accGyro);
+	LSM6DSO_GYRO_SetOutputDataRate(&accGyro, 104.0f);
+	
+	uint8_t *data;
+	uint16_t samples;
+	lsm6dso_fifo_status2_t fifo_status;
+	
+	LSM6DSO_FIFO_ACC_Set_BDR(&accGyro, 104.0f);
+	LSM6DSO_FIFO_GYRO_Set_BDR(&accGyro, 104.0f);
+	LSM6DSO_FIFO_Set_Watermark_Level(&accGyro, 10);
+	LSM6DSO_FIFO_Set_Stop_On_Fth(&accGyro, 1);
 
-	uint32_t i = 0;
+	str = malloc_string("FIFO init OK\r\n");
+	SendStrToUartQueue(str);
+
+	//uint32_t i = 0;
 	for(;;)
 	{
-		str = malloc_stringf("Task %s String #%d\r\n", (char*)param, i++);
+		//str = malloc_stringf("Task %s String #%d\r\n", (char*)param, i++);
+		//SendStrToUartQueue(str);
+		
+		LSM6DSO_FIFO_Set_Mode(&accGyro, LSM6DSO_FIFO_MODE);
+		
+		// ... wait data ...
+		uint32_t tick = HAL_GetTick();
+		do
+		{
+			if(HAL_GetTick() - tick > 5000)
+				break;
+			LSM6DSO_Read_Reg(&accGyro, LSM6DSO_FIFO_STATUS2, (uint8_t*)&fifo_status);
+		} while (fifo_status.fifo_wtm_ia == 0 && fifo_status.fifo_full_ia == 0);
+		
+		// ... print status ...
+		str = malloc_stringf("FIFO_STATUS2: WTM_IA(%d) OVR_IA(%d) FULL_IA(%d) CNTR_BDR_IA(%d) OVR_LATCH(%d) NULL(%d) DIFF98(%d)\r\n",
+								fifo_status.fifo_wtm_ia, fifo_status.fifo_ovr_ia, fifo_status.fifo_full_ia,
+								fifo_status.counter_bdr_ia, fifo_status.over_run_latched, fifo_status.not_used_01,
+								fifo_status.diff_fifo);
 		SendStrToUartQueue(str);
+		
+		LSM6DSO_FIFO_Get_Num_Samples(&accGyro, &samples);
+		if(samples != 0)
+		{
+			data = pvGetBuffer(samples*7);
+			LSM6DSO_Bus_ReadReg(accGyro.IO.Address, LSM6DSO_FIFO_DATA_OUT_TAG, data, samples*7);
+			// ... print data ...
+			SendToUartQueue(data, samples*7);
+		}
+		else
+		{
+			str = malloc_string("FIFO is empty!\r\n");
+			SendStrToUartQueue(str);
+		}
+		
+		LSM6DSO_FIFO_Set_Mode(&accGyro, LSM6DSO_BYPASS_MODE);
+		
 		vTaskDelay(1000 / portTICK_RATE_MS);
 	}
 	
@@ -122,27 +184,35 @@ void vTask1(void *param)
 void vUartSenderTask(void *param)
 {
 	portBASE_TYPE xStatus;
-	char *str;
+	SendBuff send;
 	for(;;)
 	{
-		xStatus = xQueueReceive(xUartSendQueue, &str, portMAX_DELAY);
-		(void)uart_print(str);
-		pvReleaseBuffer(str);
+		xStatus = xQueueReceive(xUartSendQueue, &send, portMAX_DELAY);
+		(void)uart_send(send.data, send.size);
+		pvReleaseBuffer(send.data);
 	}
 	vTaskDelete(NULL);
 }
 
-uint32_t uart_print(char *str)
+uint32_t uart_send(uint8_t *buff, uint32_t size)
 {
-	return HAL_UART_Transmit(&hlpuart1, (uint8_t*)str, strlen(str), 100);
+	return HAL_UART_Transmit(&hlpuart1, buff, size, 100);
 }
 
 uint32_t SendStrToUartQueue(char *str)
 {
+	return SendToUartQueue((uint8_t*)str, strlen(str));
+}
+
+uint32_t SendToUartQueue(uint8_t *buff, uint32_t size)
+{
 	portBASE_TYPE xStatus;
-	if(str == NULL)
+	if(buff == NULL)
 		return pdFALSE;
-	xStatus = xQueueSendToBack(xUartSendQueue, &str, 10 / portTICK_RATE_MS);
+	SendBuff send = {buff, size};
+	xStatus = xQueueSendToBack(xUartSendQueue, &send, 10 / portTICK_RATE_MS);
+	if(xStatus == pdFALSE)
+		pvReleaseBuffer(buff);
 	return xStatus;
 }
 
@@ -196,10 +266,12 @@ int main(void)
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  xUartSendQueue = xQueueCreate(5, sizeof(char*));
+  char *str;
+  xUartSendQueue = xQueueCreate(5, sizeof(SendBuff));
   if(xUartSendQueue == NULL)
   {
-	  uart_print("xUartQueue = NULL\r\n");
+	  str = "xUartQueue = NULL\r\n";
+	  uart_send((uint8_t*)str, sizeof(str)-1);
   }
   else
   {
@@ -212,7 +284,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
 	xTaskCreate(vTask1, "Task1", configMINIMAL_STACK_SIZE, "1", 1, NULL);
-	xTaskCreate(vTask1, "Task2", configMINIMAL_STACK_SIZE, "2", 1, NULL);
+	//xTaskCreate(vTask1, "Task2", configMINIMAL_STACK_SIZE, "2", 1, NULL);
 	xTaskCreate(vUartSenderTask, "UartSenderTask", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
   /* USER CODE END RTOS_THREADS */
 
@@ -224,7 +296,8 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   }
-  uart_print("Sheduler start fail\r\n");
+  str = "Sheduler start fail\r\n";
+  uart_send((uint8_t*)str, sizeof(str)-1);
   while (1)
   {
     /* USER CODE END WHILE */
